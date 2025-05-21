@@ -1,0 +1,173 @@
+#!/bin/bash
+#SBATCH -J 01fit   
+#SBATCH -p scavenger        
+#SBATCH -N 2              
+#SBATCH --ntasks-per-node=42  
+#SBATCH -c 2                
+#SBATCH --mem-per-cpu=5G    
+#SBATCH --mail-type=fail    
+#SBATCH --mail-type=end     
+#SBATCH --mail-user=cc887@duke.edu
+##SBATCH --mem=466G  
+
+# ==================== Environment Setup ====================
+source ~/.bashrc
+module load FHIaims-intel
+ulimit -s unlimited
+
+# ==================== Auto-generate input files ====================
+
+# Configuration
+SRC_DIR="."
+DEST_DIR="H_relaxed_structure"
+THRESHOLD=40
+TIGHTNESS="intermediate"   # Choose from light / intermediate / tight / really_tight
+
+CONTROL_TEMPLATE=$(cat <<EOF
+xc                 pbe
+spin               none
+relativistic       atomic_zora scalar
+vdw_correction_hirshfeld_alkali
+
+#Large calculation
+use_local_index .true.
+
+# k-grid settings
+k_grid
+
+relax_geometry bfgs 5E-3
+relax_unit_cell none
+write_restart_geometry .true.
+EOF
+)
+
+# Atomic number mapping
+declare -A atomic_numbers=(
+  [H]="01" [He]="02" [Li]="03" [Be]="04" [B]="05" [C]="06" [N]="07" [O]="08" [F]="09" [Ne]="10"
+  [Na]="11" [Mg]="12" [Al]="13" [Si]="14" [P]="15" [S]="16" [Cl]="17" [Ar]="18" [K]="19" [Ca]="20"
+  [Sc]="21" [Ti]="22" [V]="23" [Cr]="24" [Mn]="25" [Fe]="26" [Co]="27" [Ni]="28" [Cu]="29" [Zn]="30"
+  [Ga]="31" [Ge]="32" [As]="33" [Se]="34" [Br]="35" [Kr]="36" [Rb]="37" [Sr]="38" [Y]="39" [Zr]="40"
+  [Nb]="41" [Mo]="42" [Tc]="43" [Ru]="44" [Rh]="45" [Pd]="46" [Ag]="47" [Cd]="48" [In]="49" [Sn]="50"
+  [Sb]="51" [Te]="52" [I]="53" [Xe]="54" [Cs]="55" [Ba]="56" [La]="57" [Hf]="72" [Ta]="73" [W]="74"
+  [Re]="75" [Os]="76" [Ir]="77" [Pt]="78" [Au]="79" [Hg]="80" [Tl]="81" [Pb]="82" [Bi]="83" [Po]="84"
+  [At]="85" [Rn]="86" [Fr]="87" [Ra]="88"
+)
+
+mkdir -p "$DEST_DIR"
+
+compute_k_grid() {
+    geometry_file="$1"
+    local vectors=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        clean_line="${line//$'\r'/}"
+        if [[ "$clean_line" == lattice_vector* ]]; then
+            read _ x y z <<< "$clean_line"
+            vectors+=("$x $y $z")
+        fi
+    done < "$geometry_file"
+
+    if [ ${#vectors[@]} -ne 3 ]; then
+        echo "Error: Less than 3 lattice vectors in $geometry_file"
+        echo "1 1 1"
+        return
+    fi
+
+    local kgrid=()
+    for vec in "${vectors[@]}"; do
+        length=$(echo "$vec" | awk '{printf "%.8f", sqrt($1*$1 + $2*$2 + $3*$3)}')
+        k=$(awk -v t="$THRESHOLD" -v l="$length" 'BEGIN{print int((t/l)+0.999)}')
+        if ((k < 1)); then k=1; fi
+        kgrid+=("$k")
+    done
+
+    echo "${kgrid[0]} ${kgrid[1]} ${kgrid[2]}"
+}
+
+# Generate geometry.in and control.in
+for folder in "$SRC_DIR"/*/; do
+    folder_name=$(basename "$folder")
+
+    if [[ "$folder_name" =~ ^[0-9]+(_[a-zA-Z0-9_-]+)?$ ]]; then
+        echo "Preparing inputs for folder: $folder_name"
+
+        found_infile=false
+        for infile in "$folder"/*.in; do
+            [ -e "$infile" ] || continue
+            found_infile=true
+
+            has_H_atom=false
+            unique_species=()
+
+            # First pass to check if H exists and collect species
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                clean_line="${line//$'\r'/}"
+                if [[ "$clean_line" == atom* ]]; then
+                    element=$(echo "$clean_line" | awk '{print $5}')
+                    if [[ "$element" == "H" ]]; then
+                        has_H_atom=true
+                    fi
+                    if [[ ! " ${unique_species[*]} " =~ " ${element} " ]]; then
+                        unique_species+=("$element")
+                    fi
+                fi
+            done < "$infile"
+
+            if [[ "$has_H_atom" == true ]]; then
+                mkdir -p "$DEST_DIR/$folder_name"
+                outfile="$DEST_DIR/$folder_name/geometry.in"
+                > "$outfile"
+
+                # Write geometry.in with constraints
+                while IFS= read -r line || [[ -n "$line" ]]; do
+                    clean_line="${line//$'\r'/}"
+                    if [[ "$clean_line" == atom* ]]; then
+                        element=$(echo "$clean_line" | awk '{print $5}')
+                        echo "$clean_line" >> "$outfile"
+                        if [[ "$element" != "H" ]]; then
+                            echo "constrain_relaxation .true." >> "$outfile"
+                        fi
+                    else
+                        echo "$clean_line" >> "$outfile"
+                    fi
+                done < "$infile"
+
+                # Write control.in
+                kgrid_val=$(compute_k_grid "$outfile")
+                control_path="$DEST_DIR/$folder_name/control.in"
+                echo "$CONTROL_TEMPLATE" | while IFS= read -r control_line || [[ -n "$control_line" ]]; do
+                    clean_control_line="${control_line//$'\r'/}"
+                    if [[ "$clean_control_line" == k_grid* ]]; then
+                        echo "k_grid $kgrid_val" >> "$control_path"
+                    else
+                        echo "$clean_control_line" >> "$control_path"
+                    fi
+                done
+
+                for species in "${unique_species[@]}"; do
+                    atomic_num="${atomic_numbers[$species]}"
+                    if [ -z "$atomic_num" ]; then
+                        echo "Warning: Unknown species symbol $species in $folder_name"
+                        continue
+                    fi
+                    default_file="$SPECIES_DEFAULTS/defaults_2020/${TIGHTNESS}/${atomic_num}_${species}_default"
+                    if [ -f "$default_file" ]; then
+                        cat "$default_file" >> "$control_path"
+                    else
+                        echo "Warning: Default file $default_file not found!"
+                    fi
+                done
+            fi
+
+            break  # Only process first .in file
+        done
+    fi
+done
+
+# ==================== Execute FHI-aims in each folder ====================
+for calc_folder in "$DEST_DIR"/*/; do
+    echo "Running FHI-aims in $calc_folder"
+    cd "$calc_folder"
+    mpirun -n $SLURM_NTASKS aims.x > aims.out 2> aims.err
+    cd $SLURM_SUBMIT_DIR
+done
